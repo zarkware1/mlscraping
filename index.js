@@ -94,7 +94,14 @@ async function fetchUrl(url, cookieHeader) {
     });
 
     let status = 0;
-    const response = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 }).catch(() => null);
+    // Bater direto numa URL de produto, sem Referer nenhum, se parece com
+    // "alguém digitou essa URL exata na barra de endereço" — padrão raro
+    // pra usuário real, comum pra scraper. Um clique real (ou "abrir em
+    // nova aba") sempre carrega um Referer da página de origem; replicando
+    // isso aqui como se tivéssemos vindo da home do ML.
+    const response = await page
+      .goto(url, { waitUntil: "networkidle", timeout: 30000, referer: "https://www.mercadolivre.com.br/" })
+      .catch(() => null);
     if (response) status = response.status();
     const html = await page.content();
 
