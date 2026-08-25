@@ -73,25 +73,25 @@ async function fetchUrl(url, cookieHeader) {
     viewport: { width: 1366, height: 768 },
   });
   try {
-    if (cookieHeader) {
-      // Bug real: usar o subdomínio exato da URL (ex: "produto.mercadolivre.
-      // com.br") como domínio do cookie fazia a sessão não valer mais depois
-      // de um redirect pra outro subdomínio (ex: "www.mercadolivre.com.br/
-      // gz/account-verification") — igual um navegador de verdade, o
-      // Playwright só manda a cookie se o domínio bater. O código antigo
-      // (fetch cru) não tinha esse problema porque simplesmente grudava o
-      // mesmo header Cookie em toda requisição, sem checar domínio nenhum.
-      // Como esse serviço só lida com o Mercado Livre, fixa no domínio raiz
-      // — cobre todos os subdomínios (www, produto, etc.) de uma vez.
-      const cookies = parseCookieHeader(cookieHeader, ".mercadolivre.com.br");
-      if (cookies.length > 0) await context.addCookies(cookies);
-    }
     const page = await context.newPage();
     // Trick comum de stealth: navigator.webdriver=true denuncia automação
     // pra qualquer site que cheque isso via JS.
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     });
+
+    if (cookieHeader) {
+      // Achado testando manualmente num navegador real: uma aba anônima
+      // "limpa" já tem cookies de apoio próprios (_d2id, sessão do Hotjar,
+      // etc.) antes de logar — só depois entram ssid/_csrf/etc. Um ssid
+      // "sozinho", sem NENHUM cookie de apoio, é um padrão mais estranho
+      // ainda do que um _d2id de dispositivo errado. Visita a home primeiro
+      // pra deixar o próprio site gerar esses cookies de apoio, igual uma
+      // sessão anônima real, e só DEPOIS aplica as 5 cookies de identidade.
+      await page.goto("https://www.mercadolivre.com.br/", { waitUntil: "networkidle", timeout: 30000 }).catch(() => {});
+      const cookies = parseCookieHeader(cookieHeader, ".mercadolivre.com.br");
+      if (cookies.length > 0) await context.addCookies(cookies);
+    }
 
     let status = 0;
     // Bater direto numa URL de produto, sem Referer nenhum, se parece com
