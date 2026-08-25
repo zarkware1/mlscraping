@@ -1,7 +1,7 @@
 {
   "name": "ml-proxy",
   "version": "1.0.0",
-  "description": "Proxy para scraping do Mercado Livre",
+  "description": "Proxy para scraping do Mercado Livre (Playwright/Chromium)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,6 +10,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "https-proxy-agent": "^7.0.5"
+    "playwright": "1.55.1"
   }
 }

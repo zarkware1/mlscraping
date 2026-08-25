@@ -1,99 +1,100 @@
 const http = require("http");
-const https = require("https");
-const { HttpsProxyAgent } = require("https-proxy-agent");
+const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.PROXY_SECRET || "";
 
-// O Railway usa IPs de datacenter (faixa do Google Cloud) — o Mercado Livre
-// bloqueia essa faixa independente do IP específico ou dos cookies estarem
-// válidos (confirmado: trocar de IP via redeploy não resolveu). A correção
-// é rotear a saída por um proxy residencial (Proxy-Cheap), cujos IPs não
-// caem nesse tipo de bloqueio em massa.
-//
-// Credencial esperada em PROXY_CHEAP_CREDENTIALS no formato que o painel do
-// Proxy-Cheap já mostra: "host:port:username:password". Sem essa variável
-// configurada, cai de volta pra conexão direta (mesmo comportamento de
-// antes) — assim o serviço não quebra se a env var ainda não foi setada.
-function buildUpstreamAgent() {
+// Teste em andamento: o ML bloqueava requisições HTTP cruas (módulo https do
+// Node) mesmo com cookies válidos — não dava pra saber se era a FAIXA de IP
+// do Railway/datacenter, ou o fingerprint de conexão (o handshake TLS do
+// Node não é igual ao de um Chrome de verdade, algo que sistemas anti-bot
+// sofisticados detectam independente do IP). Trocado pra um Chromium real
+// via Playwright — se isso já bastar, evita o custo de proxy residencial.
+// PROXY_CHEAP_CREDENTIALS continua opcional (formato "host:port:username:
+// password") caso o navegador real sozinho não seja suficiente.
+function buildProxyConfig() {
   const raw = process.env.PROXY_CHEAP_CREDENTIALS || "";
-  if (!raw) return null;
+  if (!raw) return undefined;
   const parts = raw.split(":");
   if (parts.length < 4) {
     console.warn("PROXY_CHEAP_CREDENTIALS mal formatada — esperado host:port:username:password");
-    return null;
+    return undefined;
   }
   const [host, port, username, ...passwordParts] = parts;
   const password = passwordParts.join(":");
-  const proxyUrl = `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
-  return new HttpsProxyAgent(proxyUrl);
+  return { server: `http://${host}:${port}`, username, password };
+}
+const proxyConfig = buildProxyConfig();
+
+// Um browser só, reaproveitado entre requisições (lançar Chromium do zero a
+// cada fetch custa ~1-2s); cada requisição ganha seu próprio context
+// (cookies isoladas), fechado ao final — bem mais barato que fechar o
+// browser inteiro.
+let browserPromise = null;
+function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: ["--disable-blink-features=AutomationControlled"],
+      proxy: proxyConfig,
+    });
+  }
+  return browserPromise;
 }
 
-const upstreamAgent = buildUpstreamAgent();
-console.log(upstreamAgent ? "Proxy residencial (Proxy-Cheap) configurado." : "Sem proxy residencial — conexão direta.");
-
-function fetchUrl(url, cookies) {
-  return new Promise((resolve, reject) => {
-    const doRequest = (currentUrl, redirectCount) => {
-      if (redirectCount > 10) {
-        return reject(new Error("Too many redirects"));
-      }
-
-      const parsed = new URL(currentUrl);
-      const options = {
-        hostname: parsed.hostname,
-        path: parsed.pathname + parsed.search,
-        method: "GET",
-        ...(upstreamAgent ? { agent: upstreamAgent } : {}),
-        headers: {
-          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-          "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-          "cache-control": "no-cache",
-          "sec-fetch-dest": "document",
-          "sec-fetch-mode": "navigate",
-          "sec-fetch-site": "none",
-          "upgrade-insecure-requests": "1",
-          ...(cookies ? { cookie: cookies } : {}),
-        },
+// O cookie chega como header cru ("ssid=x; _csrf=y; ..."); Playwright exige
+// objetos estruturados por cookie.
+function parseCookieHeader(cookieHeader, domain) {
+  if (!cookieHeader) return [];
+  return cookieHeader
+    .split(";")
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const idx = pair.indexOf("=");
+      if (idx === -1) return null;
+      return {
+        name: pair.slice(0, idx).trim(),
+        value: pair.slice(idx + 1).trim(),
+        domain,
+        path: "/",
       };
+    })
+    .filter(Boolean);
+}
 
-      const req = https.request(options, (res) => {
-        // Segue redirects manualmente para capturar a URL final
-        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-          const location = res.headers["location"];
-          if (location) {
-            const nextUrl = location.startsWith("http")
-              ? location
-              : `https://${parsed.hostname}${location}`;
-            console.log(`Redirect ${redirectCount + 1}: ${currentUrl} → ${nextUrl}`);
-            // Drena o body antes de redirecionar
-            res.resume();
-            return doRequest(nextUrl, redirectCount + 1);
-          }
-        }
-
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () =>
-          resolve({
-            status: res.statusCode,
-            body: data,
-            finalUrl: currentUrl, // URL final após todos os redirects
-          })
-        );
-      });
-
-      req.on("error", reject);
-      req.setTimeout(30000, () => {
-        req.destroy();
-        reject(new Error("Timeout"));
-      });
-      req.end();
-    };
-
-    doRequest(url, 0);
+async function fetchUrl(url, cookieHeader) {
+  const browser = await getBrowser();
+  const parsed = new URL(url);
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    locale: "pt-BR",
+    timezoneId: "America/Sao_Paulo",
+    viewport: { width: 1366, height: 768 },
   });
+  try {
+    if (cookieHeader) {
+      const bareHost = parsed.hostname.replace(/^www\./, "");
+      const cookies = parseCookieHeader(cookieHeader, `.${bareHost}`);
+      if (cookies.length > 0) await context.addCookies(cookies);
+    }
+    const page = await context.newPage();
+    // Trick comum de stealth: navigator.webdriver=true denuncia automação
+    // pra qualquer site que cheque isso via JS.
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
+
+    let status = 0;
+    const response = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 }).catch(() => null);
+    if (response) status = response.status();
+    const html = await page.content();
+
+    return { status, body: html, finalUrl: page.url() };
+  } finally {
+    await context.close();
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -110,21 +111,25 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200);
-    res.end(JSON.stringify({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      upstreamProxy: !!upstreamAgent,
-    }));
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        timestamp: new Date().toISOString(),
+        upstreamProxy: !!proxyConfig,
+        engine: "playwright-chromium",
+      })
+    );
     return;
   }
 
-  // Confirma o IP de saída atual (útil pra verificar se o proxy residencial
-  // está mesmo ativo, sem precisar passar por todo o fluxo de scraping do ML).
+  // Confirma o IP de saída atual (e se o browser real está de pé) sem
+  // precisar rodar todo o fluxo de scraping do ML.
   if (req.method === "GET" && req.url === "/whoami") {
     try {
       const resultado = await fetchUrl("https://api.ipify.org?format=json", "");
+      const bodyText = resultado.body.replace(/<[^>]+>/g, "").trim();
       res.writeHead(200);
-      res.end(JSON.stringify({ upstreamProxy: !!upstreamAgent, ip: JSON.parse(resultado.body) }));
+      res.end(JSON.stringify({ upstreamProxy: !!proxyConfig, ip: JSON.parse(bodyText) }));
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: err.message }));
@@ -158,14 +163,18 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[${new Date().toISOString()}] Fetch: ${url.slice(0, 80)}`);
       const resultado = await fetchUrl(url, cookies);
-      console.log(`[${new Date().toISOString()}] Status: ${resultado.status} | FinalUrl: ${resultado.finalUrl} | Size: ${resultado.body.length}`);
+      console.log(
+        `[${new Date().toISOString()}] Status: ${resultado.status} | FinalUrl: ${resultado.finalUrl} | Size: ${resultado.body.length}`
+      );
 
       res.writeHead(200);
-      res.end(JSON.stringify({
-        html: resultado.body,
-        status: resultado.status,
-        finalUrl: resultado.finalUrl,
-      }));
+      res.end(
+        JSON.stringify({
+          html: resultado.body,
+          status: resultado.status,
+          finalUrl: resultado.finalUrl,
+        })
+      );
     } catch (err) {
       console.error("Erro:", err.message);
       res.writeHead(500);
@@ -175,5 +184,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`ML Proxy rodando na porta ${PORT}`);
+  console.log(`ML Proxy (Playwright/Chromium) rodando na porta ${PORT}`);
+});
+
+process.on("SIGTERM", async () => {
+  if (browserPromise) {
+    const browser = await browserPromise;
+    await browser.close().catch(() => {});
+  }
+  process.exit(0);
 });
