@@ -10,19 +10,30 @@ const SECRET = process.env.PROXY_SECRET || "";
 // Node não é igual ao de um Chrome de verdade, algo que sistemas anti-bot
 // sofisticados detectam independente do IP). Trocado pra um Chromium real
 // via Playwright — se isso já bastar, evita o custo de proxy residencial.
-// PROXY_CHEAP_CREDENTIALS continua opcional (formato "host:port:username:
-// password") caso o navegador real sozinho não seja suficiente.
+// Confirmado necessário: todo teste de IP de datacenter (Railway/GCP/AWS)
+// caiu no muro de captcha; o mesmo teste de um IP residencial passou direto.
+// PROXY_CHEAP_CREDENTIALS aceita dois formatos, pra colar direto o que o
+// painel do Proxy-Cheap mostrar sem precisar reformatar:
+//   - "usuario:senha@host:porta"  (formato padrão de URL de proxy)
+//   - "host:porta:usuario:senha"  (formato alternativo, tipo lista/CSV)
 function buildProxyConfig() {
   const raw = process.env.PROXY_CHEAP_CREDENTIALS || "";
   if (!raw) return undefined;
-  const parts = raw.split(":");
-  if (parts.length < 4) {
-    console.warn("PROXY_CHEAP_CREDENTIALS mal formatada — esperado host:port:username:password");
-    return undefined;
+
+  const atFormat = raw.match(/^([^:@]+):([^@]+)@([^:@]+):(\d+)$/);
+  if (atFormat) {
+    const [, username, password, host, port] = atFormat;
+    return { server: `http://${host}:${port}`, username, password };
   }
-  const [host, port, username, ...passwordParts] = parts;
-  const password = passwordParts.join(":");
-  return { server: `http://${host}:${port}`, username, password };
+
+  const parts = raw.split(":");
+  if (parts.length >= 4) {
+    const [host, port, username, ...passwordParts] = parts;
+    return { server: `http://${host}:${port}`, username, password: passwordParts.join(":") };
+  }
+
+  console.warn("PROXY_CHEAP_CREDENTIALS em formato não reconhecido — esperado usuario:senha@host:porta ou host:porta:usuario:senha");
+  return undefined;
 }
 const proxyConfig = buildProxyConfig();
 
