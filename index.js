@@ -65,7 +65,6 @@ function parseCookieHeader(cookieHeader, domain) {
 
 async function fetchUrl(url, cookieHeader) {
   const browser = await getBrowser();
-  const parsed = new URL(url);
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -75,8 +74,16 @@ async function fetchUrl(url, cookieHeader) {
   });
   try {
     if (cookieHeader) {
-      const bareHost = parsed.hostname.replace(/^www\./, "");
-      const cookies = parseCookieHeader(cookieHeader, `.${bareHost}`);
+      // Bug real: usar o subdomínio exato da URL (ex: "produto.mercadolivre.
+      // com.br") como domínio do cookie fazia a sessão não valer mais depois
+      // de um redirect pra outro subdomínio (ex: "www.mercadolivre.com.br/
+      // gz/account-verification") — igual um navegador de verdade, o
+      // Playwright só manda a cookie se o domínio bater. O código antigo
+      // (fetch cru) não tinha esse problema porque simplesmente grudava o
+      // mesmo header Cookie em toda requisição, sem checar domínio nenhum.
+      // Como esse serviço só lida com o Mercado Livre, fixa no domínio raiz
+      // — cobre todos os subdomínios (www, produto, etc.) de uma vez.
+      const cookies = parseCookieHeader(cookieHeader, ".mercadolivre.com.br");
       if (cookies.length > 0) await context.addCookies(cookies);
     }
     const page = await context.newPage();
