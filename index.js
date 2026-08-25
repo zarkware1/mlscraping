@@ -114,7 +114,17 @@ async function fetchUrl(url, cookieHeader) {
       .goto(url, { waitUntil: "networkidle", timeout: 30000, referer: "https://www.mercadolivre.com.br/" })
       .catch(() => null);
     if (response) status = response.status();
-    const html = await page.content();
+
+    // Bug real: pra respostas JSON puras (ex: a API do relatório do ML, usada
+    // por ml-sync-relatorio), o Chrome embrulha automaticamente o corpo num
+    // visualizador HTML (<html><body><pre>{...}</pre>) — page.content() devolve
+    // esse DOM decorado, não o JSON cru, o que quebra todo consumidor que
+    // espera JSON.parse(html) funcionar. Só usa o DOM renderizado (com JS já
+    // executado) pra HTML de verdade; pra JSON/texto, lê o corpo puro da
+    // resposta.
+    const contentType = response ? response.headers()["content-type"] || "" : "";
+    const isRawBody = /application\/json|text\/plain/i.test(contentType);
+    const html = isRawBody && response ? await response.text() : await page.content();
 
     return { status, body: html, finalUrl: page.url() };
   } finally {
