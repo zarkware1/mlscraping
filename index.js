@@ -1,8 +1,36 @@
 const http = require("http");
 const https = require("https");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.PROXY_SECRET || "";
+
+// O Railway usa IPs de datacenter (faixa do Google Cloud) — o Mercado Livre
+// bloqueia essa faixa independente do IP específico ou dos cookies estarem
+// válidos (confirmado: trocar de IP via redeploy não resolveu). A correção
+// é rotear a saída por um proxy residencial (Proxy-Cheap), cujos IPs não
+// caem nesse tipo de bloqueio em massa.
+//
+// Credencial esperada em PROXY_CHEAP_CREDENTIALS no formato que o painel do
+// Proxy-Cheap já mostra: "host:port:username:password". Sem essa variável
+// configurada, cai de volta pra conexão direta (mesmo comportamento de
+// antes) — assim o serviço não quebra se a env var ainda não foi setada.
+function buildUpstreamAgent() {
+  const raw = process.env.PROXY_CHEAP_CREDENTIALS || "";
+  if (!raw) return null;
+  const parts = raw.split(":");
+  if (parts.length < 4) {
+    console.warn("PROXY_CHEAP_CREDENTIALS mal formatada — esperado host:port:username:password");
+    return null;
+  }
+  const [host, port, username, ...passwordParts] = parts;
+  const password = passwordParts.join(":");
+  const proxyUrl = `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+  return new HttpsProxyAgent(proxyUrl);
+}
+
+const upstreamAgent = buildUpstreamAgent();
+console.log(upstreamAgent ? "Proxy residencial (Proxy-Cheap) configurado." : "Sem proxy residencial — conexão direta.");
 
 function fetchUrl(url, cookies) {
   return new Promise((resolve, reject) => {
@@ -16,6 +44,7 @@ function fetchUrl(url, cookies) {
         hostname: parsed.hostname,
         path: parsed.pathname + parsed.search,
         method: "GET",
+        ...(upstreamAgent ? { agent: upstreamAgent } : {}),
         headers: {
           "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
           "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -81,7 +110,25 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
+    res.end(JSON.stringify({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      upstreamProxy: !!upstreamAgent,
+    }));
+    return;
+  }
+
+  // Confirma o IP de saída atual (útil pra verificar se o proxy residencial
+  // está mesmo ativo, sem precisar passar por todo o fluxo de scraping do ML).
+  if (req.method === "GET" && req.url === "/whoami") {
+    try {
+      const resultado = await fetchUrl("https://api.ipify.org?format=json", "");
+      res.writeHead(200);
+      res.end(JSON.stringify({ upstreamProxy: !!upstreamAgent, ip: JSON.parse(resultado.body) }));
+    } catch (err) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
